@@ -1,0 +1,716 @@
+%{
+	#include <iostream>
+	#include <stdlib.h>
+	#include "hw3_output.hpp"
+	//#include "parser.hpp"
+	#include "generator.hpp"
+    //#define YYERROR_VERBOSE 1
+    //#define YYDEBUG 1
+	using namespace std;
+	extern int yylex();
+	extern int yylineno;
+	int yyerror(const char * message);
+
+    symbolsTable* vars_table = new symbolsTable();         // The symbols table for variables.
+    FuncsTable* funcs_table = new FuncsTable();          // The table for all functions declared.
+    vector<string> curr_func_args;   //saves the args of the function currently being declared.
+    vector<pair<string,string>> curr_explist;     //saves the args given to the currently called function.//pair <type,reg >
+    int while_mode = 0;
+    int lastStringSize =0;
+    int lastStringReg =0;
+    string continue_label;
+    bool switch_on = false;
+	bool main_dec=false;
+    int switch_id=0;
+	
+%}
+
+%token    VOID; 
+%token    INT; 
+%token    BYTE; 
+%token    B; 
+%token    BOOL;
+
+
+%token    TRUE;
+%token    FALSE; 
+%token    RETURN; 
+%token    WHILE;
+%token    BREAK;
+%token    CONTINUE;  
+%token    SC;
+%token    COMMA;
+%token    ASSIGN;
+%token    ID; 
+%token    NUM;
+%token    STRING;
+%token    COLON;
+%token    SWITCH;
+%token    DEFAULT;
+%token    CASE;
+
+%left OR;                // changed
+%left AND;
+%left RELOPN;
+%left RELOPR;            // is RELOP == | != 
+%nonassoc     RELOPL;            // is RELOP <= | >= | > | < should be left 
+%left     ADDSUB;               // add is +/-       /// splitted BINOP
+%left     MULDIV;               // MUL is * or /
+%right    NOT;
+
+%left     LPAREN;
+%left    RPAREN;
+%nonassoc     COMMA;
+%left    LBRACE;
+%left    RBRACE;
+%left    LBRACKET;
+%left  RBRACKET;          /// not sure about LBRACKET AND LBRACKET  should be treated as LBRACE/RBARACE or LPAREN/RPAREN
+
+%nonassoc IF;
+%right    ELSE;
+%%
+
+Program:  Funcs
+          {
+              //output::endScope();
+			  //funcs_table->printTable();
+
+		  }
+		  
+Funcs :  
+		  {
+		    if(!funcs_table->checkMain()){
+               output::errorMainMissing();
+               exit(0);
+            }
+		  } 	
+
+		  | {vars_table->openScope();} FuncDecl {vars_table->closeScope();} Funcs
+		  {
+		      
+		  }
+		  
+FuncDecl: RetType ID LPAREN Formals RPAREN
+          {
+
+
+              funcs_table->Insert($2->name, $1->getType(), curr_func_args);
+              llvmFuncDecl($1->getType(), $2->name, curr_func_args);
+              FuncDeclAllocation(curr_func_args.size());
+              for (int i = 0 ; i < curr_func_args.size() ; i++){
+                  storeFuncArg(curr_func_args[i], i, curr_func_args.size());
+              }
+
+          } LBRACE Statements RBRACE
+
+		  {
+		      if($1->getType() == "VOID"){
+
+		          buffer.emit("   ret void");
+		      }else{
+                buffer.emit("ret i32 0");
+                }
+		      curr_func_args.clear();
+		      emitCommand("\n}\n");
+		  }
+
+RetType:  Type
+          {
+			 $$->type = $1->type;
+
+		  }
+		  | VOID
+		  {
+			  $$ = new Type("VOID");
+
+		  }
+
+Formals: 
+		  {
+
+		  }
+		  | FormalsList
+		  {
+
+
+		  }		
+
+FormalsList:FormalDecl 
+		  {
+
+		  }
+		  | FormalDecl COMMA FormalsList
+		  {
+		      
+		  }
+
+FormalDecl: Type ID
+		  {
+		      if(funcs_table->funcExists($2->name)){
+		          output::errorDef(yylineno, $2->name);
+		          exit(0);
+		      }
+		      vars_table->Insert($2->name, $1->type,true);
+		      curr_func_args.push_back($1->type);
+
+		  }
+		  
+Statements: Statement
+		  {
+		     $$ = dynamic_cast<Statement*>($1);
+		  }
+		  | Statements Statement	
+		  {
+		      $$ = new Statement();
+		      dynamic_cast<Statement*>($$)->nextlist = buffer.merge(dynamic_cast<Statement*>($1)->nextlist, dynamic_cast<Statement*>($2)->nextlist);
+		      dynamic_cast<Statement*>($$)->breaklist = buffer.merge(dynamic_cast<Statement*>($1)->breaklist, dynamic_cast<Statement*>($2)->breaklist);
+
+		  }
+Statement: LBRACE {vars_table->openScope();} Statements {vars_table->closeScope();} RBRACE
+		  {
+		      $$ = new Statement();
+		  }
+		  | Type ID SC	
+		  {
+
+		       if(vars_table->checkVariableDeclared($2->name) != "" || funcs_table->funcExists($2->name)){
+		           output::errorDef(yylineno, $2->name);
+		           exit(0);
+		       }
+		       vars_table->Insert($2->name, $1->type);
+			   storeVariable("0", $1->type, vars_table->varGetOffset($2->name), curr_func_args.size());
+			   $$ = new Statement();
+		  }
+		  | Type ID ASSIGN Exp SC	
+		  {
+          
+		       if(vars_table->checkVariableDeclared($2->name) != "" || funcs_table->funcExists($2->name)){
+               	   output::errorDef(yylineno, $2->name);
+               	   exit(0);
+               }
+               if($1->type != $4->type){
+                   output::errorMismatch(yylineno);
+                   exit(0);
+               }
+               vars_table->Insert($2->name, $1->type);
+			   if($1->getType() == "BOOL"){
+                   string value = llvmExpIsBool(dynamic_cast<Exp*>($4));
+                   storeVariable(value, $1->type, vars_table->varGetOffset($2->name), curr_func_args.size());
+               }
+               else{
+               
+                   storeVariable(dynamic_cast<Exp*>($4)->reg, $1->type, vars_table->varGetOffset($2->name), curr_func_args.size());
+               }
+               $$ = new Statement();
+		  }
+		  | ID ASSIGN Exp SC	
+		  {
+
+		       string id_type = vars_table->checkVariableDeclared($1->name);
+		       if(id_type == ""){
+                    output::errorUndef(yylineno, $1->name);
+                    exit(0);
+               }
+               if(id_type != $3->type && !(id_type == "INT" && $3->type == "BYTE")){
+                    output::errorMismatch(yylineno);
+                    exit(0);
+               }
+			   if(id_type == "BOOL"){
+                   string value = llvmExpIsBool(dynamic_cast<Exp*>($3));
+                   storeVariable(value, id_type, vars_table->varGetOffset($1->name), curr_func_args.size());
+               }
+               else{
+                   storeVariable(dynamic_cast<Exp*>($3)->reg, id_type, vars_table->varGetOffset($1->name), curr_func_args.size());
+
+               }
+               $$ = new Statement();
+		  }	
+		  | Call SC
+		  {
+		      $$ = new Statement();
+
+		  }
+		  | RETURN SC	
+		  {
+		      if(funcs_table->lastFuncType() != "VOID"){
+		          output::errorMismatch(yylineno);
+		          exit(0);
+		      }
+
+		      buffer.emit("   ret void");
+		      $$ = new Statement();
+		  }
+		  | RETURN Exp SC
+		  {
+		      if(funcs_table->lastFuncType() != $2->type && ! (funcs_table->lastFuncType()== "INT" && $2->type == "BYTE")){
+              	  output::errorMismatch(yylineno);
+              	  exit(0);
+              }
+              if ($2->type == "BOOL"){
+                  dynamic_cast<Exp*>($2)->reg = llvmExpIsBool(dynamic_cast<Exp*>($2));
+              }
+
+              if (funcs_table->lastFuncType() != $2->type){
+                  zext(dynamic_cast<Exp*>($2)->reg, convert_to_llvm_type($2->type));
+              }
+              string ret_type = (convert_to_llvm_type($2->type) == "i8" ) ? "i32" : convert_to_llvm_type($2->type);
+              buffer.emit("   ret i32 "  + dynamic_cast<Exp*>($2)->reg);
+              
+              $$ = new Statement();
+            
+		  }
+		  | IF LPAREN ExpBool RPAREN M Statement
+		  {
+		      $$ = new Statement();
+		      vars_table->closeScope();
+		      llvmIfStmt(dynamic_cast<Statement*>($$), dynamic_cast<Exp*>($3), dynamic_cast<Statement*>($6), dynamic_cast<Statement*>($5)->label);
+
+		  }
+		  | IF LPAREN ExpBool RPAREN M Statement ELSE {  vars_table->closeScope(); vars_table->openScope();} N M Statement
+		  {
+
+		      vars_table->closeScope();
+		      $$ = new Statement();
+		      llvmIfElseStmt(dynamic_cast<Statement*>($$), dynamic_cast<Exp*>($3), dynamic_cast<Statement*>($6),
+		      dynamic_cast<Statement*>($9), dynamic_cast<Statement*>($11), dynamic_cast<Statement*>($5)->label,
+		      dynamic_cast<Statement*>($10)->label);
+
+		  }
+		  | WHILE LPAREN Q Exp RPAREN {vars_table->openScope(); while_mode++; } M Statement
+		  {
+		      $$ = new Statement();
+		      vars_table->closeScope();
+		      while_mode--;
+		      llvmWhileStmt(dynamic_cast<Statement*>($$), dynamic_cast<Exp*>($4), dynamic_cast<Statement*>($8), dynamic_cast<Statement*>($7)->label, dynamic_cast<Statement*>($3)->label);
+          }
+		  | BREAK SC
+		  {
+		      if(while_mode==0 && !switch_on){
+		          output::errorUnexpectedBreak(yylineno);
+		          exit(0);
+		      }
+
+		      $$ = new Statement();
+		      int address = buffer.emit("   br label @");
+		      dynamic_cast<Statement*>($$)->breaklist = buffer.makelist(make_pair(address,FIRST));
+
+		  }
+		  | CONTINUE SC
+		  {
+		      if(while_mode==0){
+		          output::errorUnexpectedContinue(yylineno);
+		          exit(0);
+		      }
+
+		      $$ = new Statement();
+		      buffer.emit("   br label %" + continue_label);
+		      buffer.genLabel();
+
+		  }
+            |SWITCH {switch_on = true; } LPAREN Exp {  
+            string type = dynamic_cast<Exp*>($4)->type;
+            if (type != "INT" && type != "BYTE") {
+                output::errorMismatch(yylineno);
+                exit(0);
+            }} RPAREN LBRACE{  vars_table->openScope();} CaseList { 
+            string type = dynamic_cast<Exp*>($4)->type;
+            vector<CaseDecl*> cases =  dynamic_cast<CaseList*>($9)->case_vec;
+            for (auto &i : cases) {
+                if (i->type != "INT" && i->type != "BYTE") {
+                    output::errorMismatch(yylineno);
+                    exit(0);
+                }
+            }
+            }{
+                $$ = new Statement();
+                vars_table->closeScope();
+                switch_on=false;
+                set_code_gen();
+                }RBRACE
+
+ExpBool: Exp{
+     $$=$1;
+    if($1->type != "BOOL"){
+        output::errorMismatch(yylineno);
+        exit(0);
+    }
+    vars_table->openScope();
+}
+
+Call:      ID LPAREN Explist RPAREN
+          {
+
+              
+              string name =  dynamic_cast<Identifier*>($1)->name;
+              string func_type = funcs_table->checkArgsValid( dynamic_cast<Identifier*>($1)->name,curr_explist);
+              string res_reg=call_emit(func_type, name, curr_explist); 
+              if(res_reg!="no reg"){
+              $$=new Call(func_type,res_reg);
+              }else{
+               $$=new Call(func_type);
+              
+              }
+			  curr_explist.clear();
+              
+		  }
+          | ID LPAREN RPAREN
+		  {
+
+              string name =  dynamic_cast<Identifier*>($1)->name;
+              string func_type = funcs_table->checkArgsValid( dynamic_cast<Identifier*>($1)->name,curr_explist);
+              string res_reg=call_emit(func_type, name, {}); 
+              $$=new Call(func_type,res_reg);
+			  curr_explist.clear();
+		  }
+
+Explist:    Exp
+          {
+          
+            string exp_type =dynamic_cast<Exp*>($1)->type;
+            string reg;
+             if (exp_type=="BOOL") {
+                reg=llvmExpIsBool(dynamic_cast<Exp*>($1));
+                curr_explist.push_back(make_pair("BOOL", reg)); 
+               
+            } else{
+                curr_explist.push_back(make_pair(dynamic_cast<Exp*>($1)->type, dynamic_cast<Exp*>($1)->reg)); 
+             }
+          
+		  }
+          | Exp {
+          
+            string exp_type =dynamic_cast<Exp*>($1)->type;
+            string reg;
+             if (exp_type=="BOOL") {
+                dynamic_cast<Exp*>($1)->reg=llvmExpIsBool(dynamic_cast<Exp*>($1));
+            } 
+          
+		  } COMMA Explist
+		  {
+            curr_explist.push_back(make_pair(dynamic_cast<Exp*>($1)->type, dynamic_cast<Exp*>($1)->reg));
+		  }
+
+Type :      INT
+          {
+			$$= $1;
+		  }
+          |  BYTE
+		  {
+			$$= $1;
+
+		  }
+          | BOOL
+		  {
+            $$= $1;
+		  }
+         
+
+Exp:        LPAREN Exp RPAREN//Done
+          {
+          
+			 $$= new Exp((dynamic_cast<Exp*>($2)));;
+		  }
+          | ID
+		  {
+                string type = vars_table->checkVariableDeclared( dynamic_cast<Identifier*>($1)->name);
+                if(type == ""){
+                    output::errorUndef(yylineno, $1->name);
+                    exit(0);
+                }
+                //emit id from table
+                
+                  string exp_reg = emit_id(vars_table->varGetOffset(dynamic_cast<Identifier*>($1)->name), curr_func_args.size());
+                
+                $$= new Exp(type);
+                dynamic_cast<Exp*>($$)->reg=exp_reg;
+                //if the type is bool, add to falselist/truelist of $$
+             
+                 if (type=="BOOL") {
+                 
+                    string reg1=freshVar();
+                    buffer.emit(reg1+"=trunc i32 "+dynamic_cast<Exp*>($$)->reg+" to i1");
+                  
+                    int line = buffer.emit("br i1 "+reg1+", label @, label @");
+                
+                     dynamic_cast<Exp*>($$)->falseList=buffer.makelist(make_pair(line,SECOND));
+                    dynamic_cast<Exp*>($$)->trueList=buffer.makelist(make_pair(line,FIRST));
+                }
+                
+		  }
+          | Call //DONE
+		  {
+                $$= new Exp($1->type);
+                dynamic_cast<Exp*>($$)->name= $1->name;
+                dynamic_cast<Exp*>($$)->reg= dynamic_cast<Call*>($1)->reg;
+                if (dynamic_cast<Call*>($1)->type=="BOOL") {
+                 
+                    string reg1=freshVar();
+                    buffer.emit(reg1+"=trunc i32 "+dynamic_cast<Exp*>($$)->reg+" to i1");
+                 
+                    int line = buffer.emit("br i1 "+reg1+", label @, label @");
+                    dynamic_cast<Exp*>($$)->falseList=buffer.makelist(make_pair(line,SECOND));
+                    dynamic_cast<Exp*>($$)->trueList=buffer.makelist(make_pair(line,FIRST));
+                  
+                }
+                
+           
+		  }
+          | NUM//DONE
+		  {
+                $$= new Exp("INT");
+                 dynamic_cast<Exp*>($$)->reg=freshVar();
+                buffer.emit(dynamic_cast<Exp*>($$)->reg+" = add i32 "+dynamic_cast<Num*>($1)->getVal()+", 0");
+               
+		  }
+          | NUM B //DONE
+		  {
+                
+                $$= new Exp("BYTE");
+                string value = dynamic_cast<Num*>($1)->getVal();
+                if(stoi(value) > 255 ){   //byte can't be above 255
+                    output::errorByteTooLarge(yylineno, value);
+                    exit(0);
+                }
+                
+                dynamic_cast<Exp*>($$)->reg = freshVar();
+          
+                buffer.emit( dynamic_cast<Exp*>($$)->reg+" = add i32 "+dynamic_cast<Num*>($1)->getVal()+", 0");
+               
+		  }
+          | STRING //TOCONTINUE
+		  {
+                $$= new Exp("STRING");
+                string str=(dynamic_cast<String*>($1))->getValue(); 
+                // str+='\00';
+                int str_size = dynamic_cast<String*>($1)->getSize(); 
+                lastStringSize=str_size-1;
+                //dynamic_cast<Exp>($$)->reg=freshVar();
+                // lastStringReg=freshVar();
+               str= str.substr(1, str.size() - 2);
+               str+="\\00";
+               buffer.emitGlobal("@string"+to_string(lastStringReg++)+" = constant ["+to_string(str_size-1)+" x i8] c\""+str+"\"");
+              
+		  }
+          | TRUE //DONE
+		  { 
+
+                $$= new Exp("BOOL");
+                //buffer.emit("%" + dynamic_cast<Exp*>($$)->reg + " = add i1 0,1");
+
+                int line=buffer.emit("br label @");
+                //addToTrueList(dynamic_cast<Exp*>($$),make_pair(line,FIRST));
+                    dynamic_cast<Exp*>($$)->trueList=buffer.makelist(make_pair(line,FIRST));
+		  }
+          | FALSE //DONE
+		  {
+              $$= new Exp("BOOL");
+              //buffer.emit("%" + dynamic_cast<Exp*>($$)->reg + " = add i1 0,0");
+
+              int line=buffer.emit("br label @");
+             // addToFalseList(dynamic_cast<Exp*>($$), make_pair(line,FIRST));
+                dynamic_cast<Exp*>($$)->falseList=buffer.makelist(make_pair(line,SECOND));
+		  }
+          | NOT Exp
+		  {
+                if($2->type != "BOOL"){
+                    output::errorMismatch(yylineno);
+                    exit(0);
+                }else{  //this is like the lecture, just switch the truelist/falselist
+                    $$= new Exp("BOOL");
+                    (dynamic_cast<Exp*>($$))->falseList = (dynamic_cast<Exp*>($2))->trueList;  //maybe change this to something better
+                    (dynamic_cast<Exp*>($$))->trueList = (dynamic_cast<Exp*>($2))->falseList;
+                   // (dynamic_cast<Exp*>($$))->reg = (dynamic_cast<Exp*>($2))->reg;  //is this right?
+                }
+			  
+		  }
+          | Exp AND M Exp
+		  {
+                if(($1->type != "BOOL") || ($4->type != "BOOL")){
+                
+                    output::errorMismatch(yylineno);
+                    exit(0);
+                }
+       
+                $$ = new Exp("BOOL");
+                dynamic_cast<Exp*>($$)->reg=freshVar();
+                buffer.bpatch(dynamic_cast<Exp*>($1)->trueList, dynamic_cast<Statement*>($3)->label);
+                dynamic_cast<Exp*>($$)->trueList = dynamic_cast<Exp*>($4)->trueList;
+                dynamic_cast<Exp*>($$)->falseList = buffer.merge(dynamic_cast<Exp*>($1)->falseList, dynamic_cast<Exp*>($4)->falseList);
+		  }
+          | Exp OR M Exp{
+                    if(($1->type != "BOOL") || ($4->type != "BOOL")){
+                    //printf("here\n");
+                    output::errorMismatch(yylineno);
+                    exit(0);
+                    }
+                    $$ = new Exp("BOOL");
+                    dynamic_cast<Exp*>($$)->reg=freshVar();
+                    buffer.bpatch(dynamic_cast<Exp*>($1)->falseList, dynamic_cast<Statement*>($3)->label);
+                    dynamic_cast<Exp*>($$)->trueList = buffer.merge(dynamic_cast<Exp*>($1)->trueList, dynamic_cast<Exp*>($4)->trueList);
+                    dynamic_cast<Exp*>($$)->falseList = dynamic_cast<Exp*>($4)->falseList;
+		  }
+          | Exp ADDSUB Exp       //todo add the set related cases
+		  {
+
+                if((($1->type != "INT") &&($1->type != "BYTE") &&($1->type != "SET"))  || (($3->type != "INT") &&($3->type != "BYTE") &&($3->type != "SET"))){
+                    output::errorMismatch(yylineno);
+                    exit(0);
+                }
+                if(($1->type == "SET") ||($3->type == "SET")){
+                    $$= new Exp("SET");
+                }
+                else if(($1->type == "INT") ||($3->type == "INT")){
+                    $$= new Exp("INT");
+                }else if($1->type == "BYTE" || $3->type == "BYTE"){
+                    $$ = new Exp("BYTE");
+                    
+                }
+                /*else{
+                 
+                    $$= new Exp("BOOL"); //check this again!!
+                }*/
+                string op = llvmOpCommand((dynamic_cast<Identifier*>($2))->name);
+                //$$= new Exp(dynamic_cast<Exp*>($1),dynamic_cast<Exp*>($3),$2->value,byteFlag);
+                bool byteFlag = (dynamic_cast<Exp*>($$)->type=="BYTE") ? true:false;
+               // string op = llvmOpCommand((dynamic_cast<Identifier*>($2))->name);
+                string exp_reg=llvmExpBinOp(dynamic_cast<Exp*>($$), dynamic_cast<Exp*>($1),dynamic_cast<Exp*>($3),op,byteFlag);
+                dynamic_cast<Exp*>($$)->reg =exp_reg;
+
+		  }
+          | Exp MULDIV Exp       //todo: need to add SET to binop
+		  {
+                
+                if((($1->type != "INT") &&($1->type != "BYTE"))  || (($3->type != "INT") &&($3->type != "BYTE"))){
+                    output::errorMismatch(yylineno);
+                    exit(0);
+                }
+                
+                if(($1->type == "INT") ||($2->type == "INT")){
+                
+                    $$= new Exp("INT");
+                }else{
+                        $$= new Exp("BYTE");
+                        
+                }
+                string op = llvmOpCommand((dynamic_cast<Identifier*>($2))->name);
+                bool byteFlag = (dynamic_cast<Exp*>($$)->type=="BYTE") ? true:false;
+                string exp_reg = llvmExpBinOp(dynamic_cast<Exp*>($$), dynamic_cast<Exp*>($1),dynamic_cast<Exp*>($3),op,byteFlag);
+                 dynamic_cast<Exp*>($$)->reg = exp_reg;
+		  }
+		  | Exp RELOPN Exp  //todo
+		  {
+               if(!((($1->type=="INT")|| ($1->type =="BYTE")) && ($3->type == "SET"))){
+                    output::errorMismatch(yylineno);
+                    exit(0);
+                }
+                $$= new Exp("BOOL");
+		  }
+          | LPAREN Type RPAREN Exp //todo the casting from set to int-> casting from set to int gives the size of the set.
+		  {
+          
+                if(($2->type!="INT") ||($4->type != "SET")){
+                    output::errorMismatch(yylineno);
+                    exit(0);
+                }
+                $$= new Exp("INT"); 
+			 
+		  }
+		  | Exp RELOPL Exp //DONE
+		  {
+                if((($1->type != "INT") &&($1->type != "BYTE"))  || (($3->type != "INT") &&($3->type != "BYTE"))  ){
+                    output::errorMismatch(yylineno);
+                    exit(0);
+                }
+            
+                $$= new Exp("BOOL");
+                string op = llvmOpCommand((dynamic_cast<Identifier*>($2))->name);
+                llvmExpRelOp(dynamic_cast<Exp*>($$), dynamic_cast<Exp*>($1),dynamic_cast<Exp*>($3),op);
+            
+
+		  }| Exp RELOPR Exp //
+		  {
+                if((($1->type != "INT") &&($1->type != "BYTE"))  || (($3->type != "INT") &&($3->type != "BYTE"))  ){
+                    output::errorMismatch(yylineno);
+                    exit(0);
+                }
+                $$= new Exp("BOOL");
+                string op = llvmOpCommand((dynamic_cast<Identifier*>($2))->name);
+                llvmExpRelOp(dynamic_cast<Exp*>($$), dynamic_cast<Exp*>($1),dynamic_cast<Exp*>($3),op);
+		  }
+CaseList: CaseDecl CaseList{  
+
+            //$$ = new CaseList(dynamic_cast<CaseDecl*>($1),dynamic_cast<CaseList*>($2));
+          }
+          | CaseDecl{
+
+           // $$ = new CaseList(CaseList(dynamic_cast<CaseDecl*>($1)));
+          }
+          |DEFAULT COLON W Statements{
+                //$$ = new CaseList();
+                /* int loc = buffer.emit("br label @");
+                dynamic_cast<CaseList*>($$)->breakList = buffer.makelist({loc, FIRST});*/
+
+          }
+CaseDecl: CASE NUM COLON Statements{
+         /*$$ = new CaseDecl("INT");
+            dynamic_cast<CaseDecl*>($$)->breakList= dynamic_cast<Statement*>($4)->breaklist;*/
+          }
+
+M : {
+       $$ = new Statement();
+       dynamic_cast<Statement*>($$)->label = buffer.getLabelName();
+       buffer.emit("br label %" +   dynamic_cast<Statement*>($$)->label);
+       buffer.emit(dynamic_cast<Statement*>($$)->label + ":");
+       }
+Q : {
+       $$ = new Statement();
+       dynamic_cast<Statement*>($$)->label = buffer.getLabelName();
+       buffer.emit("br label %" +   dynamic_cast<Statement*>($$)->label);
+       buffer.emit(dynamic_cast<Statement*>($$)->label + ":");
+       continue_label = dynamic_cast<Statement*>($$)->label;
+       }
+
+N : {
+      $$ = new Statement();
+      int address = buffer.emit("   br label @");
+      dynamic_cast<Statement*>($$)->nextlist = buffer.makelist(make_pair(address,FIRST));
+    }
+W :{
+    int loc = buffer.emit("br label @");
+    string inst = buffer.genLabel();
+    buffer.bpatch(buffer.makelist({loc, FIRST}), inst);
+   }    
+%%
+
+int main(){
+	// init the codeBuffer
+	buffer.emitGlobal("declare i32 @printf(i8*, ...)");
+    buffer.emitGlobal("declare void @exit(i32)\n");
+    buffer.emitGlobal("@.int_specifier = constant [4 x i8] c\"\%d\\0A\\00\"");
+    buffer.emitGlobal("@.str_specifier = constant [4 x i8] c\"\%s\\0A\\00\"");
+    buffer.emitGlobal("@.divByZeroErrorCode = constant [23 x i8] c\"Error division by zero\\00\"");
+    buffer.emitGlobal("define void @printi(i32) {");
+    buffer.emitGlobal("   call i32 (i8*, ...) @printf(i8* getelementptr ([4 x i8], [4 x i8]* @.int_specifier, i32 0, i32 0), i32 %0)");
+    buffer.emitGlobal("   ret void");
+    buffer.emitGlobal("}\n");
+    buffer.emitGlobal("define void @print(i8*) {");
+    buffer.emitGlobal("   call i32 (i8*, ...) @printf(i8* getelementptr ([4 x i8], [4 x i8]* @.str_specifier, i32 0, i32 0), i8* %0)");
+    buffer.emitGlobal("   ret void");
+    buffer.emitGlobal("}\n");
+    buffer.emitGlobal("define void @DivisionByZero() {");
+    buffer.emitGlobal("   %1 = getelementptr [23 x i8], [23 x i8]* @.divByZeroErrorCode, i32 0, i32 0");
+    buffer.emitGlobal("   call void @print(i8* %1)");
+    buffer.emitGlobal("   call void @exit(i32 0)");
+    buffer.emitGlobal("   ret void\n}");
+    yyparse();
+    buffer.printGlobalBuffer();
+
+    buffer.printCodeBuffer();
+}
+		  
+int yyerror(const char * message)
+{
+
+	output::errorSyn(yylineno);
+	exit(0);
+}
